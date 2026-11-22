@@ -805,25 +805,77 @@ function saveJSON(k,v){try{localStorage.setItem(k,JSON.stringify(v));}catch(e){}
 function getProfile(){return loadJSON("sfp_profile",{age:"adult",cond:"none",skin:"medium"});}
 
 /* ---------- fetch ---------- */
+/* Har request par hard timeout — koi bhi API latak jaye to panel 60s tak
+   "Fresh data ka intezar…" par nahi rukta, fail foran hota hai aur retry hota hai. */
+var FETCH_SEQ=0;
+function fetchJSON(url,timeoutMs){
+ var ctrl=("AbortController" in window)?new AbortController():null;
+ var timer=ctrl?setTimeout(function(){try{ctrl.abort();}catch(e){}},timeoutMs||10000):null;
+ return fetch(url,ctrl?{signal:ctrl.signal}:{}).then(function(r){
+  if(timer)clearTimeout(timer);
+  if(!r.ok)throw new Error("HTTP "+r.status);
+  return r.json();
+ }).catch(function(e){if(timer)clearTimeout(timer);throw e;});
+}
+/* Pehli load par ek transient nakami (DNS/connection reset, slow mobile net)
+   poora panel nahi marti — khud-ba-khud 3 dafa koshish hoti hai. */
+function fetchRetry(url,timeoutMs,attempts){
+ var delays=[0,700,1800];
+ function tryOnce(n){
+  return fetchJSON(url,timeoutMs).catch(function(e){
+   if(n>=(attempts||3))throw e;
+   return new Promise(function(res){setTimeout(res,delays[n]||1500);}).then(function(){return tryOnce(n+1);});
+  });
+ }
+ return tryOnce(1);
+}
 function fetchAll(city,note){
  CUR=city;
+ var seq=++FETCH_SEQ;
  $("liveStatus").textContent=city.name+" ka live data load ho raha hai…";
  if($("freshLabel"))$("freshLabel").textContent=city.name+" ka fresh data aa raha hai…";
  var wxUrl="https://api.open-meteo.com/v1/forecast?latitude="+city.lat+"&longitude="+city.lon+"&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,cloud_cover,surface_pressure,wind_speed_10m,wind_direction_10m,wind_gusts_10m&hourly=temperature_2m,dew_point_2m,precipitation_probability,weather_code,visibility,uv_index&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max,wind_speed_10m_max,wind_gusts_10m_max&minutely_15=precipitation,precipitation_probability&timezone=auto&forecast_days=16&forecast_minutely_15=8";
  var aqUrl="https://air-quality-api.open-meteo.com/v1/air-quality?latitude="+city.lat+"&longitude="+city.lon+"&current=us_aqi,european_aqi,pm2_5,pm10,ozone,nitrogen_dioxide,sulphur_dioxide,carbon_monoxide&hourly=us_aqi,pm2_5&timezone=auto&forecast_days=3";
  var seasUrl="https://seasonal-api.open-meteo.com/v1/seasonal?latitude="+city.lat+"&longitude="+city.lon+"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=Asia%2FKarachi&forecast_days=45";
- Promise.all([fetch(wxUrl).then(function(r){return r.json();}),fetch(aqUrl).then(function(r){return r.json();}),fetch(seasUrl).then(function(r){return r.json();}).catch(function(){return null;})]).then(function(res){
-  LIVE={city:city,wx:res[0],aq:res[1],seasonal:res[2],ts:Date.now()};
+ /* Sirf weather + AQI ka intezar hota hai. 45-day seasonal API sab se slow hai —
+    pehle woh isi Promise.all mein thi, is liye poora panel us ke peeche ruk jata tha.
+    Ab woh background mein aati hai aur outlook ko baad mein update karti hai. */
+ Promise.all([fetchRetry(wxUrl,10000,3),fetchRetry(aqUrl,10000,3)]).then(function(res){
+  if(seq!==FETCH_SEQ)return; /* is se nayi request shuru ho chuki hai — purana jawab nazarandaz */
+  if(!res[0]||!res[0].current||!res[0].hourly||!res[0].daily||!res[1]||!res[1].current||!res[1].hourly)throw new Error("incomplete data");
+  if(RETRY_TIMER){clearInterval(RETRY_TIMER);RETRY_TIMER=null;}
+  var prevSeasonal=(LIVE&&LIVE.seasonal&&LIVE.city&&Math.abs(LIVE.city.lat-city.lat)<0.01&&Math.abs(LIVE.city.lon-city.lon)<0.01)?LIVE.seasonal:null;
+  LIVE={city:city,wx:res[0],aq:res[1],seasonal:prevSeasonal,ts:Date.now()};
   saveJSON("sfp_cache",LIVE);
-  renderAll();renderRainNext();renderOutlook();
+  /* Render ki ghalti kabhi "internet nahi mila" nahi kehlati — data aa gaya hai to status LIVE rahega. */
+  try{renderAll();}catch(e){}
+  try{renderRainNext();}catch(e){}
+  try{renderOutlook();}catch(e){}
   var t=new Date();$("liveStatus").textContent="✅ Live — "+city.name+" · Updated "+t.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})+" PKT/local · Source: Open-Meteo (weather + CAMS air quality)"+(note?" · "+note:"");
   if($("freshLabel"))$("freshLabel").textContent="Live hai — aakhri update "+t.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
-  if($("freshDetail"))$("freshDetail").textContent=city.name+" ke liye weather, AQI, agle 2 ghante ki barish aur 45-day outlook isi open par fresh aaye hain. Map aur radar bhi neeche fresh load hote hain.";
+  if($("freshDetail"))$("freshDetail").textContent=city.name+" ke liye weather aur AQI isi open par fresh aaye hain. 45-day outlook aur map/radar background mein fresh ho rahe hain.";
+  fetchJSON(seasUrl,20000).then(function(s){
+   if(seq!==FETCH_SEQ||!LIVE)return;
+   LIVE.seasonal=s;saveJSON("sfp_cache",LIVE);
+   try{renderOutlook();}catch(e){}
+  }).catch(function(){if(seq===FETCH_SEQ){try{renderOutlook();}catch(e){}}});
  }).catch(function(){
-  if(LIVE){$("liveStatus").textContent="⚠️ Internet nahi mila — neeche is device par saved aakhri data dikhaya ja raha hai ("+new Date(LIVE.ts).toLocaleString("en-GB")+").";}
-  else{$("liveStatus").textContent="⚠️ Live data load nahi ho saka — internet check karo aur page dobara kholo. Tab tak neeche November 2026 ke dated snapshots aur saare working tools maujood hain.";$("wxCond").textContent="Live data abhi nahi mila — internet check karo.";}
+  if(seq!==FETCH_SEQ)return;
+  if(LIVE&&LIVE.wx&&LIVE.aq){$("liveStatus").textContent="⚠️ Internet nahi mila — neeche is device par saved aakhri data dikhaya ja raha hai ("+new Date(LIVE.ts).toLocaleString("en-GB")+"). Khud dobara koshish ho rahi hai…";scheduleAutoRetry(city);}
+  else{$("liveStatus").textContent="⚠️ Live data abhi nahi mila — khud dobara koshish ho rahi hai. Internet bilkul na ho to neeche November 2026 ke dated snapshots aur saare working tools maujood hain.";$("wxCond").textContent="Live data load ho raha hai — dobara koshish jari hai…";if($("freshLabel"))$("freshLabel").textContent="Network ka intezar — auto-retry jari hai…";scheduleAutoRetry(city);}
  });
 }
+/* Agar pehli koshishen nakam hon to page khud har 15s baad dobara try karta hai —
+   manual refresh dabane ki zaroorat nahi. Live data aate hi yeh band ho jata hai. */
+var RETRY_TIMER=null;
+function scheduleAutoRetry(city){
+ if(RETRY_TIMER)return;
+ RETRY_TIMER=setInterval(function(){
+  if(!document.hidden&&CUR){fetchAll(CUR,"Auto-retry");}
+ },15000);
+}
+/* Jaise hi browser wapas online ho, foran fresh data lo. */
+window.addEventListener("online",function(){if(CUR)fetchAll(CUR,"Internet wapas aate hi refresh");});
 function hourIdx(){var times=LIVE.wx.hourly.time;var cur=LIVE.wx.current.time;var idx=0;for(var i=0;i<times.length;i++){if(times[i]<=cur)idx=i;else break;}return idx;}
 function aqIdx(){var times=LIVE.aq.hourly.time;var cur=LIVE.wx.current.time;var idx=0;for(var i=0;i<times.length;i++){if(times[i]<=cur)idx=i;else break;}return idx;}
 function ctx(){
@@ -1174,9 +1226,12 @@ if($("radarPlay"))$("radarPlay").addEventListener("click",function(){
 setTimeout(function(){initMapData();loadRadar();setTimeout(function(){if(leafMap)leafMap.invalidateSize();},400);},600);
 /* ---------- boot ---------- */
 var cache=loadJSON("sfp_cache",null);
-if(cache&&cache.wx&&cache.aq){LIVE=cache;CUR=cache.city;renderAll();try{renderRainNext();renderOutlook();}catch(e){}$("liveStatus").textContent="Is device par saved aakhri data ("+new Date(cache.ts).toLocaleString("en-GB")+") — fresh data load ho raha hai…";}
-renderSaved();renderFamily();
+if(cache&&cache.wx&&cache.aq){LIVE=cache;CUR=cache.city;try{renderAll();renderRainNext();renderOutlook();}catch(e){}$("liveStatus").textContent="Is device par saved aakhri data ("+new Date(cache.ts).toLocaleString("en-GB")+") — fresh data load ho raha hai…";}
+/* Live fetch SAB SE PEHLE shuru hota hai — saved-cities/family ke render mein
+   koi ghalti ho bhi jaye to pehli load ka live data nahi rukta. */
 fetchAll(CUR);
+try{renderSaved();}catch(e){}
+try{renderFamily();}catch(e){}
 if(navigator.geolocation){navigator.geolocation.getCurrentPosition(function(pos){
  fetch("https://api.bigdatacloud.net/data/reverse-geocode-client?latitude="+pos.coords.latitude+"&longitude="+pos.coords.longitude+"&localityLanguage=en").then(function(r){return r.json();}).then(function(g){
   var nm=(g.city||g.locality||"Meri location");fetchAll({name:nm,lat:pos.coords.latitude,lon:pos.coords.longitude},"Location device se li gayi — kisi server par save nahi hui.");
