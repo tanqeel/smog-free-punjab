@@ -235,7 +235,7 @@ body.light .hero img,body.light .chart-card svg,body.light #aqiChartWrap{display
 
 <div class="grid c2" style="margin-top:16px">
 <div class="card" aria-live="polite">
-<p style="font-weight:700" id="wxCity">—</p>
+<p style="font-weight:700" id="wxCity">📍 Aap ka sheher dhoondh rahe hain…</p>
 <p class="big-temp"><span id="wxTemp">--</span>°C</p>
 <p class="cond" id="wxCond">Live mausam load ho raha hai…</p>
 <p id="wxFeels" style="color:var(--muted)"></p>
@@ -1046,22 +1046,26 @@ function updateSkyLive(x){
 
 /* ---------- controls ---------- */
 var chipsBox=$("cityChips");
-PK_CITIES.forEach(function(ct){var b=document.createElement("button");b.className="chip";b.type="button";b.textContent=ct[0];b.addEventListener("click",function(){fetchAll({name:ct[0],lat:ct[1],lon:ct[2]});});chipsBox.appendChild(b);});
+PK_CITIES.forEach(function(ct){var b=document.createElement("button");b.className="chip";b.type="button";b.textContent=ct[0];b.addEventListener("click",function(){USER_PICKED=true;fetchAll({name:ct[0],lat:ct[1],lon:ct[2]});});chipsBox.appendChild(b);});
 $("locBtn").addEventListener("click",function(){
+ USER_PICKED=true;
  if(!navigator.geolocation){$("liveStatus").textContent="Is browser mein geolocation nahi — sheher search karo ya chip chuno.";return;}
  $("liveStatus").textContent="Location li ja rahi hai… (browser permission mangega — Allow karo. Location sirf isi device par rehti hai.)";
+ var locSettled=false;
+ var locWatchdog=setTimeout(function(){if(!locSettled){locSettled=true;$("liveStatus").textContent="Location ka jawab nahi aaya (timeout) — sheher search karo ya neeche chip chuno. Default Lahore ka live data chal raha hai.";}},9000);
  navigator.geolocation.getCurrentPosition(function(pos){
+  if(locSettled)return;locSettled=true;clearTimeout(locWatchdog);
   var lat=pos.coords.latitude,lon=pos.coords.longitude;
-  fetch("https://api.bigdatacloud.net/data/reverse-geocode-client?latitude="+lat+"&longitude="+lon+"&localityLanguage=en").then(function(r){return r.json();}).then(function(g){
+  fetchJSON("https://api.bigdatacloud.net/data/reverse-geocode-client?latitude="+lat+"&longitude="+lon+"&localityLanguage=en",6000).then(function(g){
    var nm=(g.city||g.locality||"Meri location");fetchAll({name:nm,lat:lat,lon:lon},"Location device se li gayi — kisi server par save nahi hui.");
   }).catch(function(){fetchAll({name:"Meri location",lat:lat,lon:lon});});
- },function(){$("liveStatus").textContent="Location nahi mili ya Allow nahi hua — sheher search karo ya neeche chip chuno. Default Lahore ka live data chal raha hai.";},{timeout:8000});
+ },function(){if(!locSettled){locSettled=true;clearTimeout(locWatchdog);}$("liveStatus").textContent="Location nahi mili ya Allow nahi hua — sheher search karo ya neeche chip chuno. Default Lahore ka live data chal raha hai.";},{timeout:8000});
 });
 function doSearch(){
  var q=$("citySearch").value.trim();if(!q)return;var box=$("searchResults");box.innerHTML="<p>Search ho raha hai…</p>";
  fetch("https://geocoding-api.open-meteo.com/v1/search?name="+encodeURIComponent(q)+"&count=6&language=en&format=json").then(function(r){return r.json();}).then(function(g){
   if(!g.results||!g.results.length){box.innerHTML="<p>Koi sheher nahi mila — spelling check karo.</p>";return;}
-  box.innerHTML="";g.results.forEach(function(r){var b=document.createElement("button");b.type="button";b.textContent=r.name+" — "+(r.admin1||"")+", "+(r.country||"");b.addEventListener("click",function(){box.innerHTML="";fetchAll({name:r.name,lat:r.latitude,lon:r.longitude});});box.appendChild(b);});
+  box.innerHTML="";g.results.forEach(function(r){var b=document.createElement("button");b.type="button";b.textContent=r.name+" — "+(r.admin1||"")+", "+(r.country||"");b.addEventListener("click",function(){USER_PICKED=true;box.innerHTML="";fetchAll({name:r.name,lat:r.latitude,lon:r.longitude});});box.appendChild(b);});
  }).catch(function(){box.innerHTML="<p>Search fail — internet check karo.</p>";});
 }
 $("searchBtn").addEventListener("click",doSearch);
@@ -1082,7 +1086,7 @@ function renderSaved(){
   var x=document.createElement("button");x.className="x";x.textContent="✕";x.setAttribute("aria-label","Remove "+sv.name);
   x.addEventListener("click",function(){var s2=loadJSON("sfp_saved",[]);s2.splice(i,1);saveJSON("sfp_saved",s2);renderSaved();});
   var go=document.createElement("button");go.className="chip";go.textContent="Kholo";
-  go.addEventListener("click",function(){fetchAll({name:sv.name,lat:sv.lat,lon:sv.lon});window.scrollTo({top:0,behavior:"smooth"});document.getElementById("now").scrollIntoView();});
+  go.addEventListener("click",function(){USER_PICKED=true;fetchAll({name:sv.name,lat:sv.lat,lon:sv.lon});window.scrollTo({top:0,behavior:"smooth"});document.getElementById("now").scrollIntoView();});
   div.appendChild(go);div.appendChild(x);box.appendChild(div);
   fetch("https://api.open-meteo.com/v1/forecast?latitude="+sv.lat+"&longitude="+sv.lon+"&current=temperature_2m,weather_code&timezone=auto").then(function(r){return r.json();}).then(function(w){
    return fetch("https://air-quality-api.open-meteo.com/v1/air-quality?latitude="+sv.lat+"&longitude="+sv.lon+"&current=us_aqi&timezone=auto").then(function(r){return r.json();}).then(function(aq){
@@ -1225,18 +1229,85 @@ if($("radarPlay"))$("radarPlay").addEventListener("click",function(){
 /* load map after page settles so Leaflet sizes correctly */
 setTimeout(function(){initMapData();loadRadar();setTimeout(function(){if(leafMap)leafMap.invalidateSize();},400);},600);
 /* ---------- boot ---------- */
+/* SHEHER LOCATION SE BANTAA HAI — Lahore hardcoded default NAHI hai.
+   Boot par do cheezein PARALLEL race karti hain, dono par sakht timeout:
+   (1) browser geolocation (GPS), (2) IP-based city lookup (ipapi.co).
+   Jo pehle resolve ho, usi sheher ki live fetch FORAN shuru ho jati hai —
+   user Multan mein hai to pehli load par Multan hi aayega.
+   Dono fail/timeout ho jayen to pehle is device ka saved sheher, aur woh
+   bhi na ho to — sirf aakhri fallback ke tor par — Lahore.
+   Geolocation par browser ke timeout ke ilawa JS watchdog bhi hai: kuch
+   browsers/webviews mein callback kabhi resolve hi nahi hoti, aur panel
+   pehle usi ke peeche 60s+ tak "-- °C / -- AQI" par atka rehta tha.
+   Fallback render ho jane ke BAAD location mile to panel detected sheher
+   par swap + refetch ho jata hai. User khud sheher chun le to auto-swap band. */
+var USER_PICKED=false;
 var cache=loadJSON("sfp_cache",null);
+var savedCity=(cache&&cache.city&&cache.city.lat!=null&&cache.city.lon!=null)?cache.city:null;
 if(cache&&cache.wx&&cache.aq){LIVE=cache;CUR=cache.city;try{renderAll();renderRainNext();renderOutlook();}catch(e){}$("liveStatus").textContent="Is device par saved aakhri data ("+new Date(cache.ts).toLocaleString("en-GB")+") — fresh data load ho raha hai…";}
-/* Live fetch SAB SE PEHLE shuru hota hai — saved-cities/family ke render mein
-   koi ghalti ho bhi jaye to pehli load ka live data nahi rukta. */
-fetchAll(CUR);
 try{renderSaved();}catch(e){}
 try{renderFamily();}catch(e){}
-if(navigator.geolocation){navigator.geolocation.getCurrentPosition(function(pos){
- fetch("https://api.bigdatacloud.net/data/reverse-geocode-client?latitude="+pos.coords.latitude+"&longitude="+pos.coords.longitude+"&localityLanguage=en").then(function(r){return r.json();}).then(function(g){
-  var nm=(g.city||g.locality||"Meri location");fetchAll({name:nm,lat:pos.coords.latitude,lon:pos.coords.longitude},"Location device se li gayi — kisi server par save nahi hui.");
- }).catch(function(){});
-},function(){},{timeout:6000});}
+var cityResolved=false,fetchStarted=false;
+function startFetch(city,note){fetchStarted=true;try{fetchAll(city,note);}catch(e){}}
+function resolveCity(city,note,precise){
+ if(USER_PICKED||!city||city.lat==null||city.lon==null)return;
+ if(cityResolved&&!precise)return; /* pehle se resolved — sirf GPS (precise) baad mein swap kar sakta hai */
+ if(fetchStarted&&CUR&&Math.abs(CUR.lat-city.lat)<0.01&&Math.abs(CUR.lon-city.lon)<0.01){cityResolved=true;return;} /* wahi sheher pehle se chal raha hai */
+ cityResolved=true;
+ startFetch(city,note);
+}
+/* (1) Geolocation — coords milte hi fetch shuru; sheher ka naam reverse-geocode
+   se background mein aata hai aur sirf label update hota hai, dobara fetch nahi. */
+if(navigator.geolocation){
+ var bootTs=Date.now();
+ try{
+  navigator.geolocation.getCurrentPosition(function(pos){
+   if(Date.now()-bootTs>60000)return; /* bohat purana jawab — nazarandaz; panel is par kabhi rukta nahi, fallback neeche hai */
+   var gc={name:"Meri location",lat:pos.coords.latitude,lon:pos.coords.longitude};
+   resolveCity(gc,"Location device se li gayi — kisi server par save nahi hui.",true);
+   fetchJSON("https://api.bigdatacloud.net/data/reverse-geocode-client?latitude="+gc.lat+"&longitude="+gc.lon+"&localityLanguage=en",4000).then(function(g){
+    var nm=(g&&(g.city||g.locality))||null;
+    if(!nm||USER_PICKED)return;
+    if(CUR&&Math.abs(CUR.lat-gc.lat)<0.01&&Math.abs(CUR.lon-gc.lon)<0.01){
+     CUR.name=nm;if(LIVE&&LIVE.city)LIVE.city.name=nm;
+     if(LIVE&&LIVE.wx)$("wxCity").textContent="📍 "+nm+" · "+fmtTime(LIVE.wx.current.time)+" (local)";
+    }
+   }).catch(function(){});
+  },function(){/* permission deny/timeout — kuch nahi karna; IP lookup ya fallback sheher le aayega */},{timeout:4500,maximumAge:600000});
+ }catch(e){}
+}
+/* (2) IP-based city lookup — geolocation ke saath race mein. */
+fetchJSON("https://ipapi.co/json/",4500).then(function(g){
+ if(!g||g.error||g.latitude==null||g.longitude==null)return;
+ resolveCity({name:g.city||"Meri location",lat:g.latitude,lon:g.longitude},"Sheher IP se pehchana gaya — GPS mile to exact location par swap ho jayega.",false);
+}).catch(function(){});
+/* (3) Fallback — 4.5s mein koi location na mile to saved sheher, warna Lahore. */
+setTimeout(function(){
+ if(cityResolved||fetchStarted||USER_PICKED)return;
+ if(savedCity)startFetch(savedCity,"Location abhi nahi mili — is device ke saved sheher se shuru; location milte hi swap ho jayega.");
+ else startFetch({name:"Lahore",lat:31.5497,lon:74.3436},"Location nahi mili — aakhri fallback ke tor par Lahore; apna sheher upar chip/search se chuno.");
+},4500);
+</script>
+<script>
+/* Panel watchdog — alag script, main script se bilkul independent.
+   Agar boot wali location race/fetch kisi bhi wajah se na chali ho aur
+   panel abhi bhi "--" par ho, to yeh khud fetch shuru kar deta hai:
+   pehle is device ka saved sheher, warna aakhri fallback Lahore.
+   Panel kabhi khaali nahi rukta. */
+(function(){
+ function panelBlank(){var t=document.getElementById("wxTemp");return !t||t.textContent.indexOf("--")>=0||t.textContent.trim()==="";}
+ function kick(){
+  if(!panelBlank()||typeof fetchAll!=="function")return;
+  if(typeof FETCH_SEQ==="undefined"||isNaN(FETCH_SEQ))FETCH_SEQ=0;
+  var city=null;
+  try{var c=JSON.parse(localStorage.getItem("sfp_cache")||"null");if(c&&c.city&&c.city.lat!=null)city=c.city;}catch(e){}
+  if(!city&&typeof CUR!=="undefined"&&CUR&&CUR.lat!=null)city=CUR;
+  if(!city)city={name:"Lahore",lat:31.5497,lon:74.3436};
+  try{fetchAll(city,"Watchdog ne live fetch dobara shuru ki.");}catch(e){}
+ }
+ setTimeout(kick,8000);
+ setTimeout(kick,20000);
+})();
 </script>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
