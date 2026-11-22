@@ -817,17 +817,69 @@ function fetchJSON(url,timeoutMs){
   return r.json();
  }).catch(function(e){if(timer)clearTimeout(timer);throw e;});
 }
-/* Pehli load par ek transient nakami (DNS/connection reset, slow mobile net)
-   poora panel nahi marti — khud-ba-khud 3 dafa koshish hoti hai. */
-function fetchRetry(url,timeoutMs,attempts){
- var delays=[0,700,1800];
- function tryOnce(n){
-  return fetchJSON(url,timeoutMs).catch(function(e){
+/* PANEL KA ASAL RULE — v2 aur map wale kaam karne wale code se:
+   weather aur AQI DO ALAG-ALAG fetch hain, koi Promise.all gate NAHI.
+   Pehle dono aik band Promise.all mein thay: weather wala host zara sa
+   latka (ya us ki retry cycle chalti rahi) to AQI aa kar bhi panel "--"
+   par atka rehta tha — map isi liye chalta tha ke woh sirf AQI wali
+   akeli plain fetch hai. Ab jo feed pehle aaye, usi ka hissa FORAN
+   render ho jata hai; doosri feed aate hi poora panel ban jata hai.
+   Ek feed fail ho to sirf wohi fail hoti hai, doosri nahi rukti. */
+function fetchFeed(url,timeoutMs,attempts){
+ function once(){
+  var ctrl=("AbortController" in window)?new AbortController():null;
+  var timer=ctrl?setTimeout(function(){try{ctrl.abort();}catch(e){}},timeoutMs||8000):null;
+  return fetch(url,ctrl?{signal:ctrl.signal}:{}).then(function(r){
+   if(timer)clearTimeout(timer);
+   if(!r.ok)throw new Error("HTTP "+r.status);
+   return r.json();
+  }).catch(function(e){if(timer)clearTimeout(timer);throw e;});
+ }
+ function attempt(n){
+  return once().catch(function(e){
    if(n>=(attempts||3))throw e;
-   return new Promise(function(res){setTimeout(res,delays[n]||1500);}).then(function(){return tryOnce(n+1);});
+   return new Promise(function(res){setTimeout(res,600*n);}).then(function(){return attempt(n+1);});
   });
  }
- return tryOnce(1);
+ return attempt(1);
+}
+/* Sirf mausam wala hissa — AQI ka intezar kiye baghair render. */
+function renderWxOnly(){
+ var w=LIVE.wx;if(!w||!w.current)return;var c=w.current;
+ $("wxCity").textContent="📍 "+LIVE.city.name+" · "+fmtTime(c.time)+" (local)";
+ $("wxTemp").textContent=rnd(c.temperature_2m);
+ $("wxCond").textContent=(WTEXT[c.weather_code]||"—");
+ $("wxFeels").textContent="Mehsoos hota hai (feels like): "+rnd(c.apparent_temperature)+"°C · Barish abhi: "+(c.precipitation||0)+" mm";
+ var d=w.daily;
+ if(d&&d.time&&d.time.length){
+  $("wxHiLo").textContent="Aaj: kam se kam "+rnd(d.temperature_2m_min[0])+"°C · zyada se zyada "+rnd(d.temperature_2m_max[0])+"°C";
+  $("wxSun").textContent="🌅 Sunrise "+fmtTime(d.sunrise[0])+" · 🌇 Sunset "+fmtTime(d.sunset[0]);
+  $("tSunrise").textContent=fmtTime(d.sunrise[0]);$("tSunset").textContent=fmtTime(d.sunset[0]);
+  $("tRainDay").textContent=(d.precipitation_probability_max&&d.precipitation_probability_max[0]!=null)?Math.round(d.precipitation_probability_max[0])+"%":"--";
+  $("tUv").textContent="-- / "+((d.uv_index_max&&d.uv_index_max[0]!=null)?d.uv_index_max[0].toFixed(1):"--");
+ }
+ $("wxMoon").textContent="🌙 Chaand: "+moonPhase();
+ $("tHum").textContent=rnd(c.relative_humidity_2m)+"%";
+ $("tWind").textContent=rnd(c.wind_speed_10m)+" km/h · "+(DIRS[Math.round(c.wind_direction_10m/22.5)%16]||"");
+ $("tGust").textContent=rnd(c.wind_gusts_10m)+" km/h";
+ $("tPres").textContent=rnd(c.surface_pressure);
+ $("tCloud").textContent=rnd(c.cloud_cover)+"%";
+ var times=w.hourly.time,idx=0;
+ for(var i=0;i<times.length;i++){if(times[i]<=c.time)idx=i;else break;}
+ if(w.hourly.dew_point_2m)$("tDew").textContent=rnd(w.hourly.dew_point_2m[idx])+"°C";
+ if(w.hourly.visibility&&w.hourly.visibility[idx]!=null)$("tVis").textContent=(w.hourly.visibility[idx]>=1000?(w.hourly.visibility[idx]/1000).toFixed(1)+" km":Math.round(w.hourly.visibility[idx])+" m");
+ if(w.hourly.precipitation_probability)$("tRain").textContent=(w.hourly.precipitation_probability[idx]==null?"--":Math.round(w.hourly.precipitation_probability[idx])+"%");
+ try{renderDaily();}catch(e){}
+}
+/* Sirf AQI wala hissa — mausam ka intezar kiye baghair render. */
+function renderAqOnly(){
+ var a=LIVE.aq;if(!a||!a.current)return;var ac=a.current;var b=usBand(ac.us_aqi);
+ $("aqiNum").textContent=rnd(ac.us_aqi);$("aqiNum").style.color=b.color;
+ var bandEl=$("aqiBand");bandEl.textContent=b.label;bandEl.className="band "+b.cls;
+ $("aqiEu").textContent="European AQI: "+rnd(ac.european_aqi)+" · PM2.5 is waqt ki sab se aham reading hai";
+ $("polPm25").textContent=rnd(ac.pm2_5);$("polPm10").textContent=rnd(ac.pm10);
+ $("polO3").textContent=rnd(ac.ozone);$("polNo2").textContent=rnd(ac.nitrogen_dioxide);
+ $("polSo2").textContent=rnd(ac.sulphur_dioxide);$("polCo").textContent=rnd(ac.carbon_monoxide);
 }
 function fetchAll(city,note){
  CUR=city;
@@ -837,33 +889,57 @@ function fetchAll(city,note){
  var wxUrl="https://api.open-meteo.com/v1/forecast?latitude="+city.lat+"&longitude="+city.lon+"&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,cloud_cover,surface_pressure,wind_speed_10m,wind_direction_10m,wind_gusts_10m&hourly=temperature_2m,dew_point_2m,precipitation_probability,weather_code,visibility,uv_index&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max,wind_speed_10m_max,wind_gusts_10m_max&minutely_15=precipitation,precipitation_probability&timezone=auto&forecast_days=16&forecast_minutely_15=8";
  var aqUrl="https://air-quality-api.open-meteo.com/v1/air-quality?latitude="+city.lat+"&longitude="+city.lon+"&current=us_aqi,european_aqi,pm2_5,pm10,ozone,nitrogen_dioxide,sulphur_dioxide,carbon_monoxide&hourly=us_aqi,pm2_5&timezone=auto&forecast_days=3";
  var seasUrl="https://seasonal-api.open-meteo.com/v1/seasonal?latitude="+city.lat+"&longitude="+city.lon+"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=Asia%2FKarachi&forecast_days=45";
- /* Sirf weather + AQI ka intezar hota hai. 45-day seasonal API sab se slow hai —
-    pehle woh isi Promise.all mein thi, is liye poora panel us ke peeche ruk jata tha.
-    Ab woh background mein aati hai aur outlook ko baad mein update karti hai. */
- Promise.all([fetchRetry(wxUrl,10000,3),fetchRetry(aqUrl,10000,3)]).then(function(res){
-  if(seq!==FETCH_SEQ)return; /* is se nayi request shuru ho chuki hai — purana jawab nazarandaz */
-  if(!res[0]||!res[0].current||!res[0].hourly||!res[0].daily||!res[1]||!res[1].current||!res[1].hourly)throw new Error("incomplete data");
-  if(RETRY_TIMER){clearInterval(RETRY_TIMER);RETRY_TIMER=null;}
-  var prevSeasonal=(LIVE&&LIVE.seasonal&&LIVE.city&&Math.abs(LIVE.city.lat-city.lat)<0.01&&Math.abs(LIVE.city.lon-city.lon)<0.01)?LIVE.seasonal:null;
-  LIVE={city:city,wx:res[0],aq:res[1],seasonal:prevSeasonal,ts:Date.now()};
+ var sameCity=LIVE&&LIVE.city&&Math.abs(LIVE.city.lat-city.lat)<0.01&&Math.abs(LIVE.city.lon-city.lon)<0.01;
+ var pend={wx:(sameCity&&LIVE.wx)?LIVE.wx:null,aq:(sameCity&&LIVE.aq)?LIVE.aq:null,seasonal:(sameCity&&LIVE.seasonal)?LIVE.seasonal:null};
+ var freshWx=false,freshAq=false,wxDone=false,aqDone=false,seasonalStarted=false;
+ function publish(){
+  LIVE={city:city,wx:pend.wx,aq:pend.aq,seasonal:pend.seasonal,ts:Date.now()};
   saveJSON("sfp_cache",LIVE);
   /* Render ki ghalti kabhi "internet nahi mila" nahi kehlati — data aa gaya hai to status LIVE rahega. */
-  try{renderAll();}catch(e){}
+  if(pend.wx&&pend.aq){try{renderAll();}catch(e){}}
+  else if(pend.wx){try{renderWxOnly();}catch(e){}}
+  else if(pend.aq){try{renderAqOnly();}catch(e){}}
   try{renderRainNext();}catch(e){}
   try{renderOutlook();}catch(e){}
-  var t=new Date();$("liveStatus").textContent="✅ Live — "+city.name+" · Updated "+t.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})+" PKT/local · Source: Open-Meteo (weather + CAMS air quality)"+(note?" · "+note:"");
-  if($("freshLabel"))$("freshLabel").textContent="Live hai — aakhri update "+t.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
-  if($("freshDetail"))$("freshDetail").textContent=city.name+" ke liye weather aur AQI isi open par fresh aaye hain. 45-day outlook aur map/radar background mein fresh ho rahe hain.";
-  fetchJSON(seasUrl,20000).then(function(s){
-   if(seq!==FETCH_SEQ||!LIVE)return;
-   LIVE.seasonal=s;saveJSON("sfp_cache",LIVE);
-   try{renderOutlook();}catch(e){}
-  }).catch(function(){if(seq===FETCH_SEQ){try{renderOutlook();}catch(e){}}});
- }).catch(function(){
+  if(!seasonalStarted){seasonalStarted=true;
+   fetchJSON(seasUrl,20000).then(function(s){
+    if(seq!==FETCH_SEQ||!LIVE)return;
+    pend.seasonal=s;LIVE.seasonal=s;saveJSON("sfp_cache",LIVE);
+    try{renderOutlook();}catch(e){}
+   }).catch(function(){if(seq===FETCH_SEQ){try{renderOutlook();}catch(e){}}});
+  }
+ }
+ function status(){
+  var t=new Date();
+  if(freshWx&&freshAq){
+   if(RETRY_TIMER){clearInterval(RETRY_TIMER);RETRY_TIMER=null;}
+   $("liveStatus").textContent="✅ Live — "+city.name+" · Updated "+t.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})+" PKT/local · Source: Open-Meteo (weather + CAMS air quality)"+(note?" · "+note:"");
+   if($("freshLabel"))$("freshLabel").textContent="Live hai — aakhri update "+t.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+   if($("freshDetail"))$("freshDetail").textContent=city.name+" ke liye weather aur AQI isi open par fresh aaye hain. 45-day outlook aur map/radar background mein fresh ho rahe hain.";
+  }else if(freshWx||freshAq){
+   $("liveStatus").textContent="Live — "+city.name+" ka "+(freshWx?"mausam":"AQI")+" aa gaya hai; "+(freshWx?"AQI":"mausam")+" abhi aa raha hai…"+(note?" · "+note:"");
+   if($("freshLabel"))$("freshLabel").textContent=city.name+": "+(freshWx?"mausam":"AQI")+" live hai — baaki data aa raha hai…";
+  }
+ }
+ function progress(){
   if(seq!==FETCH_SEQ)return;
+  if(freshWx&&freshAq){status();return;}
+  if(!wxDone||!aqDone)return; /* doosri feed abhi chal rahi hai — us ka anjaam aane do */
+  if(freshWx||freshAq){status();scheduleAutoRetry(city);return;}
+  /* Dono feeds fail — cache hai to woh pehle se screen par hai, warna error + auto-retry. */
   if(LIVE&&LIVE.wx&&LIVE.aq){$("liveStatus").textContent="⚠️ Internet nahi mila — neeche is device par saved aakhri data dikhaya ja raha hai ("+new Date(LIVE.ts).toLocaleString("en-GB")+"). Khud dobara koshish ho rahi hai…";scheduleAutoRetry(city);}
   else{$("liveStatus").textContent="⚠️ Live data abhi nahi mila — khud dobara koshish ho rahi hai. Internet bilkul na ho to neeche November 2026 ke dated snapshots aur saare working tools maujood hain.";$("wxCond").textContent="Live data load ho raha hai — dobara koshish jari hai…";if($("freshLabel"))$("freshLabel").textContent="Network ka intezar — auto-retry jari hai…";scheduleAutoRetry(city);}
- });
+ }
+ fetchFeed(wxUrl,8000,3).then(function(wx){
+  if(seq!==FETCH_SEQ)return;
+  if(!wx||!wx.current||!wx.hourly||!wx.daily)throw new Error("incomplete wx");
+  pend.wx=wx;freshWx=true;wxDone=true;publish();status();progress();
+ }).catch(function(){if(seq!==FETCH_SEQ)return;wxDone=true;progress();});
+ fetchFeed(aqUrl,8000,3).then(function(aq){
+  if(seq!==FETCH_SEQ)return;
+  if(!aq||!aq.current||!aq.hourly)throw new Error("incomplete aq");
+  pend.aq=aq;freshAq=true;aqDone=true;publish();status();progress();
+ }).catch(function(){if(seq!==FETCH_SEQ)return;aqDone=true;progress();});
 }
 /* Agar pehli koshishen nakam hon to page khud har 15s baad dobara try karta hai —
    manual refresh dabane ki zaroorat nahi. Live data aate hi yeh band ho jata hai. */
@@ -1234,8 +1310,9 @@ setTimeout(function(){initMapData();loadRadar();setTimeout(function(){if(leafMap
    (1) browser geolocation (GPS), (2) IP-based city lookup (ipapi.co).
    Jo pehle resolve ho, usi sheher ki live fetch FORAN shuru ho jati hai —
    user Multan mein hai to pehli load par Multan hi aayega.
-   Dono fail/timeout ho jayen to pehle is device ka saved sheher, aur woh
-   bhi na ho to — sirf aakhri fallback ke tor par — Lahore.
+   Is device par saved sheher hai to us ki fetch bhi boot par hi shuru ho
+   jati hai (location ka intezar nahi) — GPS milte hi detected sheher par
+   swap ho jata hai. Kuch bhi na mile to — sirf aakhri fallback — Lahore.
    Geolocation par browser ke timeout ke ilawa JS watchdog bhi hai: kuch
    browsers/webviews mein callback kabhi resolve hi nahi hoti, aur panel
    pehle usi ke peeche 60s+ tak "-- °C / -- AQI" par atka rehta tha.
@@ -1256,6 +1333,10 @@ function resolveCity(city,note,precise){
  cityResolved=true;
  startFetch(city,note);
 }
+/* Saved sheher hai to us ka live data FORAN load shuru — location race ke
+   intezar mein panel khaali nahi rukta. GPS (precise) mile to resolveCity
+   detected sheher par swap + refetch kar dega. */
+if(savedCity)resolveCity(savedCity,"Is device ke saved sheher se shuru — location milte hi swap ho jayega.",false);
 /* (1) Geolocation — coords milte hi fetch shuru; sheher ka naam reverse-geocode
    se background mein aata hai aur sirf label update hota hai, dobara fetch nahi. */
 if(navigator.geolocation){
